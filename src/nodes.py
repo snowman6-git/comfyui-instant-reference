@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -34,6 +35,7 @@ from .runtime import (
     read_caption_files,
     resolve_sd_scripts_file,
     run_command,
+    runtime_has_xformers,
     venv_python,
     write_json,
 )
@@ -69,6 +71,8 @@ def _read_project_version() -> str:
 NODE_VERSION = _read_project_version()
 MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.MULTILINE)
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
+ATTN_MODE_XFORMERS_PATTERN = re.compile(r'^\s*attn_mode\s*=\s*"xformers"\s*$', re.MULTILINE)
+XFORMERS_FLAG_PATTERN = re.compile(r"^\s*xformers\s*=\s*true\s*$", re.MULTILINE)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
@@ -664,10 +668,42 @@ def _write_resolved_config(
     return config_path
 
 
+def _apply_attention_fallback(config_path: Path, python_path: Path, log_path: Path) -> None:
+    """Rewrite xformers attention settings when the runtime cannot provide xformers.
+
+    Profiles default to xformers, which has prebuilt wheels on Windows x64 and linux x86_64 only.
+    On every other target the training script would crash on the missing module, so fall back to
+    torch SDPA, which is always available.
+    """
+    config_text = config_path.read_text(encoding="utf-8")
+    uses_attn_mode = ATTN_MODE_XFORMERS_PATTERN.search(config_text) is not None
+    uses_flag = XFORMERS_FLAG_PATTERN.search(config_text) is not None
+    if not uses_attn_mode and not uses_flag:
+        return
+    if runtime_has_xformers(python_path):
+        return
+
+    updated = config_text
+    if uses_attn_mode:
+        # anima_train_network maps "torch" to PyTorch SDPA.
+        updated = ATTN_MODE_XFORMERS_PATTERN.sub('attn_mode = "torch"', updated, count=1)
+    if uses_flag:
+        updated = XFORMERS_FLAG_PATTERN.sub("xformers = false", updated, count=1)
+        updated = _set_toml_key(updated, "sdpa", True)
+
+    config_path.write_text(updated, encoding="utf-8")
+    message = "instant-reference: xformers is not available for this platform, using torch SDPA attention instead."
+    logging.warning(message)
+    ensure_dir(log_path.parent)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[setup] {message}\n")
+
+
 def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path) -> Path:
     paths = get_runtime_paths()
     ensure_sd_scripts_environment(paths, log_path=log_path)
     python_path = venv_python(paths.venv)
+    _apply_attention_fallback(config_path, python_path, log_path)
     training_script = resolve_sd_scripts_file(paths, profile.script)
     command = [str(python_path)]
     if os.name == "nt":

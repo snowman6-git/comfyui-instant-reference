@@ -312,7 +312,7 @@ dependencies = [
     { name = "transformers" },
     { name = "voluptuous" },
     { name = "wandb" },
-    { name = "xformers", marker = "sys_platform == 'win32'" },
+    { name = "xformers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
 ]
 
 [package.metadata]
@@ -359,7 +359,7 @@ requires-dist = [
     { name = "transformers", specifier = "==4.54.1" },
     { name = "voluptuous", specifier = "==0.15.2" },
     { name = "wandb", specifier = "==0.18.0" },
-    { name = "xformers", marker = "sys_platform == 'win32'", specifier = ">=0.0.30" },
+    { name = "xformers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'", specifier = ">=0.0.30" },
 ]
 
 [[package]]
@@ -2129,6 +2129,7 @@ dependencies = [
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/bf/f7/dd2269cce89fd1221947dd7cc3a60707ffe721ef55c1803ac3b1a1f7ae5c/xformers-0.0.30.tar.gz", hash = "sha256:a12bf3eb39e294cdbe8a7253ac9b665f41bac61d6d98df174e34ef7bdb6f2fc4", size = 10214139, upload-time = "2025-04-28T20:51:02.045Z" }
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/c6/6f2c364881da54e51a23c17c50db0518d30353bb6da8b1751be9174df538/xformers-0.0.30-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:357875986f50f105f445dc9a002c8450623cd4a6a469865c463285d0376fe77b", size = 31521318, upload-time = "2025-04-28T20:50:41.599Z" },
     { url = "https://files.pythonhosted.org/packages/49/85/28d96d090733ba6859e4195f7c9dcb28196fc2e89197bba5de8d36f1a082/xformers-0.0.30-cp312-cp312-win_amd64.whl", hash = "sha256:8549ca30700d70dae904ec4407c6188cd73fd551e585f862c1d3aca3b7bc371c", size = 108011356, upload-time = "2025-04-28T20:50:46.611Z" },
 ]
 

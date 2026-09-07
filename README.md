@@ -43,6 +43,14 @@ Helper node for caption generation settings. Use it to control WD tagger thresho
 
 Helper node for training overrides. Use it to override steps, learning rate, network size, alpha, resolution, seed, caching behavior, and whether to force retraining instead of reusing a cached result.
 
+## Runtime Environment
+
+The node manages its own training environment under `runtime/`, so it does not touch the packages ComfyUI itself runs on.
+
+- Python `3.12` is required. On Windows it is located through the `py` launcher; on Linux/macOS the node uses the current interpreter when it is 3.12, otherwise `python3.12` from `PATH`, otherwise it lets `uv` download a managed one.
+- `runtime_env/pyproject.toml` pins the dependency set (`torch 2.7.0` / `torchvision 0.22.0` from the CUDA 12.8 wheel index) and `runtime_env/uv.lock` locks it.
+- `xformers` is installed wherever prebuilt wheels exist, which is Windows x64 and Linux x86_64. On other targets (macOS, Linux aarch64) it is skipped rather than compiled from source, and profiles that ask for xformers attention automatically fall back to torch SDPA for that run.
+
 ## Profiles
 
 ### SDXL Reference LoRA

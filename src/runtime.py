@@ -4,7 +4,9 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import queue
+import re
 import signal
 import shutil
 import subprocess
@@ -29,7 +31,8 @@ if os.name == "nt":
     from ctypes import wintypes
 
 
-SETUP_VERSION = "12"
+SETUP_VERSION = "13"
+RUNTIME_PYTHON_VERSION = "3.12"
 SD_SCRIPTS_REPO = "https://github.com/kohya-ss/sd-scripts.git"
 SD_SCRIPTS_COMMIT = "1a3ec9ea745fe9883551dfca5c947ea3d6aa68c7"
 
@@ -193,7 +196,14 @@ def runtime_project_dir() -> Path:
     return plugin_root() / "runtime_env"
 
 
+VERSION_SPEC_PATTERN = re.compile(r"^(\d+)\.(\d+)$")
+
+
 def python_version_tuple(python_executable: str | Path) -> tuple[int, int] | None:
+    spec_match = VERSION_SPEC_PATTERN.match(str(python_executable))
+    if spec_match:
+        return int(spec_match.group(1)), int(spec_match.group(2))
+
     try:
         result = subprocess.run(
             [str(python_executable), "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
@@ -221,7 +231,7 @@ def resolve_runtime_python() -> str:
     if os.name == "nt":
         try:
             result = subprocess.run(
-                ["py", "-3.12", "-c", "import sys; print(sys.executable)"],
+                ["py", f"-{RUNTIME_PYTHON_VERSION}", "-c", "import sys; print(sys.executable)"],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -230,8 +240,8 @@ def resolve_runtime_python() -> str:
             )
         except OSError as exc:
             raise RuntimeError(
-                "Python 3.12 is required for the instant-reference runtime on Windows, "
-                "but the Python launcher `py` is not available."
+                f"Python {RUNTIME_PYTHON_VERSION} is required for the instant-reference runtime on "
+                "Windows, but the Python launcher `py` is not available."
             ) from exc
 
         if result.returncode == 0:
@@ -240,24 +250,47 @@ def resolve_runtime_python() -> str:
                 return candidate
 
         raise RuntimeError(
-            "Python 3.12 is required for the instant-reference runtime on Windows. Install Python 3.12."
+            f"Python {RUNTIME_PYTHON_VERSION} is required for the instant-reference runtime on Windows. "
+            f"Install Python {RUNTIME_PYTHON_VERSION}."
         )
 
-    return sys.executable
+    target = tuple(int(part) for part in RUNTIME_PYTHON_VERSION.split("."))
+    if sys.version_info[:2] == target:
+        return sys.executable
+
+    interpreter = shutil.which(f"python{RUNTIME_PYTHON_VERSION}")
+    if interpreter is not None:
+        return interpreter
+
+    # Fall back to a uv-managed interpreter; uv downloads it on demand.
+    logging.info(
+        "instant-reference: no local Python %s found, letting uv provision one for the runtime.",
+        RUNTIME_PYTHON_VERSION,
+    )
+    return RUNTIME_PYTHON_VERSION
 
 
-def runtime_imports_ready(python_path: Path) -> bool:
-    if not python_path.exists():
-        return False
+def xformers_wheels_available() -> bool:
+    """Whether prebuilt xformers wheels exist for this platform.
+
+    xformers publishes wheels for Windows x64 and manylinux x86_64 only. Everywhere else
+    (macOS, linux aarch64) it would have to be compiled from source, so the runtime skips it
+    and training falls back to torch SDPA.
+    """
+    if sys.platform == "win32":
+        return True
+    if sys.platform == "linux":
+        return platform.machine().lower() in {"x86_64", "amd64"}
+    return False
+
+
+def _run_import_check(python_path: Path, import_statement: str) -> bool:
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    import_check = "import torch, torchvision"
-    if os.name == "nt":
-        import_check = "import torch, torchvision, xformers"
     try:
         result = subprocess.run(
-            [str(python_path), "-c", import_check],
+            [str(python_path), "-c", import_statement],
             cwd=str(plugin_root()),
             env=env,
             capture_output=True,
@@ -269,6 +302,40 @@ def runtime_imports_ready(python_path: Path) -> bool:
     except OSError:
         return False
     return result.returncode == 0
+
+
+def runtime_imports_ready(python_path: Path) -> bool:
+    if not python_path.exists():
+        return False
+    import_check = "import torch, torchvision"
+    if xformers_wheels_available():
+        import_check = "import torch, torchvision, xformers"
+    return _run_import_check(python_path, import_check)
+
+
+_XFORMERS_USABLE_CACHE: dict[str, bool] = {}
+
+
+def runtime_has_xformers(python_path: Path) -> bool:
+    """Whether the managed runtime can actually run xformers attention.
+
+    Importing `xformers.ops` is what matters: the package can be installed yet unusable when its
+    prebuilt kernels do not match the installed torch build.
+    """
+    key = str(python_path)
+    cached = _XFORMERS_USABLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    usable = python_path.exists() and _run_import_check(
+        python_path, "import xformers.ops as xops; assert xops.memory_efficient_attention is not None"
+    )
+    if not usable:
+        logging.info(
+            "instant-reference: xformers is unavailable in %s; attention falls back to torch SDPA.",
+            python_path,
+        )
+    _XFORMERS_USABLE_CACHE[key] = usable
+    return usable
 
 
 def ensure_dir(path: Path) -> Path:
@@ -366,6 +433,7 @@ def run_command(command: list[str], cwd: Path, log_path: Path | None = None, env
     merged_env.setdefault("PYTHONIOENCODING", "utf-8")
     merged_env.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
     if os.name == "nt":
+        # Triton has no Windows wheels, so keep xformers from probing for it.
         merged_env.setdefault("XFORMERS_FORCE_DISABLE_TRITON", "1")
     if env:
         merged_env.update(env)
@@ -535,6 +603,9 @@ def ensure_sd_scripts_environment(paths: RuntimePaths, log_path: Path | None = N
         log_path=log_path,
         env=sync_env,
     )
+
+    # The sync may have added or removed xformers, so re-probe on the next training run.
+    _XFORMERS_USABLE_CACHE.pop(str(python_path), None)
 
     if not runtime_imports_ready(python_path):
         raise RuntimeError(f"Managed runtime is missing required packages in {paths.venv}")

@@ -22,6 +22,11 @@ import torch
 from comfy_api.latest import ComfyExtension, io
 from PIL import Image, ImageOps
 
+try:
+    from server import PromptServer
+except Exception:  # pragma: no cover - ComfyUI is always present at runtime
+    PromptServer = None
+
 from .profiles import ProfileDefinition, SlotSpec, load_profiles, profile_map, profiles_fingerprint, replace_profile_tokens
 from .runtime import (
     ensure_dir,
@@ -75,6 +80,74 @@ ATTN_MODE_XFORMERS_PATTERN = re.compile(r'^\s*attn_mode\s*=\s*"xformers"\s*$', r
 XFORMERS_FLAG_PATTERN = re.compile(r"^\s*xformers\s*=\s*true\s*$", re.MULTILINE)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
+# WD tagger repositories, newest generation first. sd-scripts defaults to the 2023 v2 model; the
+# v3 models produce noticeably better tags, which is the main quality lever this node has over the
+# captions it feeds to training.
+DEFAULT_TAGGER_REPO = "SmilingWolf/wd-swinv2-tagger-v3"
+TAGGER_REPO_CHOICES = [
+    DEFAULT_TAGGER_REPO,
+    "SmilingWolf/wd-eva02-large-tagger-v3",
+    "SmilingWolf/wd-vit-large-tagger-v3",
+    "SmilingWolf/wd-vit-tagger-v3",
+    "SmilingWolf/wd-convnext-tagger-v3",
+    "SmilingWolf/wd-v1-4-convnext-tagger-v2",
+]
+
+
+# sd-scripts reports training progress as a tqdm line on stdout, e.g.
+# "steps:  34%|###4      | 17/50 [00:18<00:36,  1.10s/it, avr_loss=0.0626]".
+TRAIN_STEP_PATTERN = re.compile(r"steps:\s*\d+%\|[^|]*\|\s*(\d+)/(\d+)")
+TRAIN_LOSS_PATTERN = re.compile(r"avr_loss=([0-9.eE+-]+)")
+
+
+def _executing_node_id() -> str | None:
+    server = getattr(PromptServer, "instance", None) if PromptServer is not None else None
+    node_id = getattr(server, "last_node_id", None)
+    return str(node_id) if node_id is not None else None
+
+
+def _report_status(text: str) -> None:
+    """Show a one-line status under the running node. Never raises."""
+    server = getattr(PromptServer, "instance", None) if PromptServer is not None else None
+    send = getattr(server, "send_progress_text", None)
+    node_id = _executing_node_id()
+    if not callable(send) or node_id is None:
+        return
+    try:
+        send(text, node_id)
+    except Exception as exc:
+        logging.debug("instant-reference: could not send status text: %s", exc)
+
+
+class _TrainingProgressReporter:
+    """Turn sd-scripts' tqdm output into ComfyUI node progress."""
+
+    def __init__(self) -> None:
+        self._progress_bar = None
+        self._total = 0
+        self._last_text = ""
+
+    def __call__(self, line: str) -> None:
+        match = TRAIN_STEP_PATTERN.search(line)
+        if match is None:
+            return
+        current = int(match.group(1))
+        total = int(match.group(2))
+        if total <= 0:
+            return
+        if self._progress_bar is None or total != self._total:
+            self._progress_bar = comfy.utils.ProgressBar(total)
+            self._total = total
+        self._progress_bar.update_absolute(min(current, total), total)
+
+        text = f"training {current}/{total}"
+        loss_match = TRAIN_LOSS_PATTERN.search(line)
+        if loss_match is not None:
+            text += f" · loss {loss_match.group(1)}"
+        if text != self._last_text:
+            self._last_text = text
+            _report_status(text)
+
 
 @io.comfytype(io_type="LORA_STACK")
 class LoRAStack(io.ComfyTypeIO):
@@ -94,6 +167,7 @@ class ResolvedSlot:
 
 @dataclass(frozen=True)
 class TaggingOptions:
+    tagger_repo: str = DEFAULT_TAGGER_REPO
     general_threshold: float = 0.35
     character_threshold: float = 0.85
     prepend_tags: str = ""
@@ -329,6 +403,7 @@ def _unwrap_options_input(value: Any | None, key: str) -> dict[str, Any]:
 def _tagging_options_from_input(value: Any | None) -> TaggingOptions:
     resolved = _unwrap_options_input(value, "tagging_options")
     return TaggingOptions(
+        tagger_repo=str(resolved.get("tagger_repo", "") or DEFAULT_TAGGER_REPO),
         general_threshold=float(resolved.get("general_threshold", 0.35)),
         character_threshold=float(resolved.get("character_threshold", 0.85)),
         prepend_tags=str(resolved.get("prepend_tags", "")),
@@ -466,17 +541,31 @@ def _cleanup_ephemeral_artifacts(paths: list[Path]) -> None:
         path.unlink(missing_ok=True)
 
 
+def _tagger_model_location(model_dir: Path, repo_id: str) -> Path:
+    """Where tag_images_by_wd14_tagger.py stores a given repo, mirroring its own path logic."""
+    tokens = repo_id.split("/")
+    if len(tokens) == 3:
+        return model_dir / "/".join(tokens[:2]).replace("/", "_") / tokens[2]
+    return model_dir / repo_id.replace("/", "_")
+
+
 def _tag_dataset(paths, dataset_dir: Path, log_path: Path, options: TaggingOptions) -> None:
     if any(dataset_dir.glob("*.txt")):
         return
+    _report_status("preparing training runtime")
     ensure_sd_scripts_environment(paths, log_path=log_path)
     python_path = venv_python(paths.venv)
     tagger_script = resolve_sd_scripts_file(paths, "tag_images_by_wd14_tagger.py")
     tagger_model_dir = paths.sd_scripts / "wd14_tagger_model"
-    onnx_model_path = tagger_model_dir / "SmilingWolf_wd-v1-4-convnext-tagger-v2" / "model.onnx"
+    repo_id = options.tagger_repo.strip() or DEFAULT_TAGGER_REPO
+    onnx_model_path = _tagger_model_location(tagger_model_dir, repo_id) / "model.onnx"
+    image_count = len([path for path in dataset_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS])
+    _report_status(f"tagging {image_count} image(s) with {repo_id.split('/')[-1]}")
     command = [
         str(python_path),
         str(tagger_script),
+        "--repo_id",
+        repo_id,
         "--batch_size",
         "1",
         "--caption_extension",
@@ -701,6 +790,7 @@ def _apply_attention_fallback(config_path: Path, python_path: Path, log_path: Pa
 
 def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, config_path: Path, log_path: Path) -> Path:
     paths = get_runtime_paths()
+    _report_status("preparing training runtime")
     ensure_sd_scripts_environment(paths, log_path=log_path)
     python_path = venv_python(paths.venv)
     _apply_attention_fallback(config_path, python_path, log_path)
@@ -720,7 +810,14 @@ def _run_training(profile: ProfileDefinition, run_dir: Path, output_dir: Path, c
             command.extend(["--mixed_precision", mixed_precision])
     command.extend([str(training_script), "--config_file", str(config_path)])
     env = {"PYTHONPATH": str(paths.sd_scripts)}
-    run_command(command, cwd=paths.sd_scripts, log_path=log_path, env=env)
+    _report_status("starting training")
+    run_command(
+        command,
+        cwd=paths.sd_scripts,
+        log_path=log_path,
+        env=env,
+        on_output=_TrainingProgressReporter(),
+    )
     trained_lora = latest_safetensors(output_dir)
     if trained_lora is None:
         raise RuntimeError(f"Training completed but no LoRA file was found in {output_dir}")
@@ -937,6 +1034,7 @@ def _train_reference_lora(model, clip, images, profile, tagging_options=None, tr
         }
 
         if cached_lora is None:
+            _report_status("preparing training runtime")
             ensure_sd_scripts_environment(paths, log_path=run_log)
             builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
             config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
@@ -947,6 +1045,8 @@ def _train_reference_lora(model, clip, images, profile, tagging_options=None, tr
             if callable(soft_empty_cache):
                 soft_empty_cache()
             cached_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
+        else:
+            _report_status("reusing cached LoRA")
 
         if manifest.exists():
             try:
@@ -1393,6 +1493,7 @@ class TaggingOptionsV1:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "tagger_repo": (TAGGER_REPO_CHOICES, {"default": DEFAULT_TAGGER_REPO}),
                 "general_threshold": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "character_threshold": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "prepend_tags": ("STRING", {"default": "", "multiline": False}),

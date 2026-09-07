@@ -37,7 +37,11 @@ Apply-only node. It takes an incoming `lora_stack`, applies each LoRA entry in o
 
 ### Reference Tagging Options
 
-Helper node for caption generation settings. Use it to control WD tagger thresholds and basic caption cleanup such as prepending tags, appending tags, excluding tags, replacing tags, and underscore removal.
+Helper node for caption generation settings. Use it to pick the WD tagger model, control its thresholds, and apply basic caption cleanup such as prepending tags, appending tags, excluding tags, replacing tags, and underscore removal.
+
+`tagger_repo` selects which WD tagger runs. It defaults to `SmilingWolf/wd-swinv2-tagger-v3`; the v3 generation tags noticeably better than the `wd-v1-4-*-v2` model `sd-scripts` falls back to, and caption quality is the main lever this node has on the resulting LoRA. `wd-eva02-large-tagger-v3` is the most accurate option and the slowest, and the v2 model is kept in the list for reproducing older runs. The tagger is part of the cache key, so switching models retrains rather than reusing an existing LoRA.
+
+While a node runs it reports its current phase under the node, and training drives the node progress bar step by step.
 
 ### Reference Train Options
 

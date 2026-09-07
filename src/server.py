@@ -4,6 +4,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from aiohttp import web
@@ -430,16 +432,27 @@ async def instant_reference_lora_library_delete(request):
     return web.json_response({"success": True})
 
 
+def _open_in_file_manager(target: Path) -> None:
+    """Open a folder in the desktop file manager on Windows, macOS and Linux."""
+    if sys.platform == "win32":
+        os.startfile(str(target))  # type: ignore[attr-defined]
+        return
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    if shutil.which(opener) is None:
+        raise OSError(f"'{opener}' is not available, cannot open {target}")
+    subprocess.Popen(
+        [opener, str(target)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 @ROUTES.post("/instant-reference-lora/open-profiles")
 async def instant_reference_lora_open_profiles(_request):
     profiles_dir = ensure_dir(_profiles_dir())
     try:
-        os.startfile(str(profiles_dir))  # type: ignore[attr-defined]
-    except AttributeError:
-        return web.json_response(
-            {"success": False, "error": "Opening folders is only supported on this platform.", "profiles_dir": str(profiles_dir)},
-            status=400,
-        )
+        _open_in_file_manager(profiles_dir)
     except OSError as exc:
         return web.json_response(
             {"success": False, "error": str(exc), "profiles_dir": str(profiles_dir)},

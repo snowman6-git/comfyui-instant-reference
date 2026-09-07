@@ -13,6 +13,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -427,7 +428,18 @@ def _terminate_process_tree(process: subprocess.Popen, log_handle) -> None:
         logging.warning("Failed to terminate child process tree for pid %s: %s", process.pid, exc)
 
 
-def run_command(command: list[str], cwd: Path, log_path: Path | None = None, env: dict[str, str] | None = None) -> None:
+def run_command(
+    command: list[str],
+    cwd: Path,
+    log_path: Path | None = None,
+    env: dict[str, str] | None = None,
+    on_output: Callable[[str], None] | None = None,
+) -> None:
+    """Run a subprocess, streaming its output to the log.
+
+    `on_output` receives every non-empty output line as it arrives, so callers can report progress
+    while the command runs. Failures inside the callback never interrupt the command itself.
+    """
     merged_env = os.environ.copy()
     merged_env.setdefault("PYTHONUTF8", "1")
     merged_env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -517,6 +529,11 @@ def run_command(command: list[str], cwd: Path, log_path: Path | None = None, env
                 recent_output.append(text)
                 if len(recent_output) > 80:
                     recent_output = recent_output[-80:]
+                if on_output is not None:
+                    try:
+                        on_output(text)
+                    except Exception as exc:
+                        logging.debug("instant-reference: progress callback failed: %s", exc)
 
         return_code = process.wait()
         if log_handle is not None:

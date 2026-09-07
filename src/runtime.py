@@ -577,13 +577,53 @@ def recreate_venv_if_needed(paths: RuntimePaths, target_python: str, uv: str, lo
     return python_path
 
 
+def _git_output(args: list[str], cwd: Path) -> str | None:
+    """Run a read-only git command, returning its stdout or None when it fails."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
 def ensure_sd_scripts_checkout(paths: RuntimePaths, log_path: Path | None = None) -> None:
+    """Clone sd-scripts if needed and pin it to SD_SCRIPTS_COMMIT.
+
+    The profiles target specific sd-scripts features, so the checkout has to stay on the commit
+    this node was tested against. A plain clone would follow upstream's default branch instead,
+    which keeps moving.
+    """
     if not paths.sd_scripts.exists():
         run_command(
             ["git", "clone", SD_SCRIPTS_REPO, str(paths.sd_scripts)],
             cwd=paths.root,
             log_path=log_path,
         )
+
+    if _git_output(["rev-parse", "HEAD"], paths.sd_scripts) == SD_SCRIPTS_COMMIT:
+        return
+
+    if _git_output(["cat-file", "-e", f"{SD_SCRIPTS_COMMIT}^{{commit}}"], paths.sd_scripts) is None:
+        run_command(
+            ["git", "fetch", "origin", SD_SCRIPTS_COMMIT],
+            cwd=paths.sd_scripts,
+            log_path=log_path,
+        )
+    run_command(
+        ["git", "checkout", "--detach", SD_SCRIPTS_COMMIT],
+        cwd=paths.sd_scripts,
+        log_path=log_path,
+    )
 
 
 def ensure_sd_scripts_environment(paths: RuntimePaths, log_path: Path | None = None) -> None:
@@ -594,8 +634,9 @@ def ensure_sd_scripts_environment(paths: RuntimePaths, log_path: Path | None = N
     python_path = recreate_venv_if_needed(paths, runtime_python, uv, log_path=log_path)
 
     marker = paths.venv / ".sd_scripts_ready"
+    marker_value = f"{SETUP_VERSION}:{SD_SCRIPTS_COMMIT}"
     if marker.exists():
-        if marker.read_text(encoding="utf-8").strip() == SETUP_VERSION and runtime_imports_ready(python_path):
+        if marker.read_text(encoding="utf-8").strip() == marker_value and runtime_imports_ready(python_path):
             return
 
     sync_env = os.environ.copy()
@@ -627,7 +668,7 @@ def ensure_sd_scripts_environment(paths: RuntimePaths, log_path: Path | None = N
     if not runtime_imports_ready(python_path):
         raise RuntimeError(f"Managed runtime is missing required packages in {paths.venv}")
 
-    marker.write_text(f"{SETUP_VERSION}\n", encoding="utf-8")
+    marker.write_text(f"{marker_value}\n", encoding="utf-8")
 
 
 def resolve_sd_scripts_file(paths: RuntimePaths, relative_script: str) -> Path:

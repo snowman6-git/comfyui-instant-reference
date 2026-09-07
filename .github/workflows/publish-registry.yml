@@ -49,8 +49,10 @@ jobs:
                   raise RuntimeError(f"Could not stamp version in {path}")
               path.write_text(updated, encoding="utf-8")
 
+          # Only the published node's pyproject carries a release version. runtime_env is a private
+          # virtual project pinned by runtime_env/uv.lock, and stamping its version makes that lock
+          # stale, so `uv sync` would re-resolve from the network instead of using the pin.
           stamp_version("pyproject.toml")
-          stamp_version("runtime_env/pyproject.toml")
 
           version_line = next(
               line

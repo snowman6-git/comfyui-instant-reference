@@ -41,6 +41,7 @@ from .runtime import (
     resolve_sd_scripts_file,
     run_command,
     runtime_has_xformers,
+    stable_artifact_path,
     venv_python,
     write_json,
 )
@@ -74,6 +75,9 @@ def _read_project_version() -> str:
 
 
 NODE_VERSION = _read_project_version()
+# Bump only when a change makes previously cached LoRAs wrong. NODE_VERSION must not be used here:
+# it carries the git sha for source checkouts, which would discard every cached LoRA on any commit.
+CACHE_FORMAT_VERSION = "1"
 MAX_TRAIN_STEPS_PATTERN = re.compile(r"^\s*max_train_steps\s*=\s*(\d+)\s*$", re.MULTILINE)
 MIXED_PRECISION_PATTERN = re.compile(r'^\s*mixed_precision\s*=\s*"([^"]+)"\s*$', re.MULTILINE)
 ATTN_MODE_XFORMERS_PATTERN = re.compile(r'^\s*attn_mode\s*=\s*"xformers"\s*$', re.MULTILINE)
@@ -238,6 +242,24 @@ def _folder_image_paths(folder_path: Path, recursive: bool, max_images: int) -> 
     return paths
 
 
+def _resize_to_cover(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    """Scale to fill `target_size` and centre-crop the overflow.
+
+    A ComfyUI IMAGE batch has to be one size, but stretching every reference to the first image's
+    exact dimensions distorts anything with a different aspect ratio, and that distortion is then
+    baked into the exported training images. Covering keeps proportions intact at the cost of
+    trimming the edges.
+    """
+    target_width, target_height = target_size
+    source_width, source_height = image.size
+    scale = max(target_width / source_width, target_height / source_height)
+    scaled_size = (max(target_width, round(source_width * scale)), max(target_height, round(source_height * scale)))
+    scaled = image.resize(scaled_size, Image.Resampling.LANCZOS)
+    left = (scaled.width - target_width) // 2
+    top = (scaled.height - target_height) // 2
+    return scaled.crop((left, top, left + target_width, top + target_height))
+
+
 def _load_folder_images(folder_path: Any, recursive: bool, max_images: int, resize_to_first: bool) -> tuple[Any, str]:
     image_paths = _folder_image_paths(
         _resolve_image_folder(folder_path),
@@ -256,7 +278,7 @@ def _load_folder_images(folder_path: Any, recursive: bool, max_images: int, resi
                     raise RuntimeError(
                         "Folder images have different sizes. Enable resize_to_first or use matching image sizes."
                     )
-                loaded = loaded.resize(target_size, Image.Resampling.LANCZOS)
+                loaded = _resize_to_cover(loaded, target_size)
             arrays.append(np.asarray(loaded, dtype=np.float32) / 255.0)
     return torch.from_numpy(np.stack(arrays, axis=0)), "\n".join(str(path) for path in image_paths)
 
@@ -499,46 +521,70 @@ def _resolve_model_slot(name: str, value: Any) -> ResolvedSlot:
     return ResolvedSlot(name=name, replacement=checkpoint_path, fingerprint=hash_text(checkpoint_path))
 
 
+def _state_dict_digest(state_dict: dict[str, Any]) -> str:
+    """Content digest of a state dict, computed in memory.
+
+    Hashing the tensors directly means an unchanged VAE or CLIP does not have to be written out
+    and read back just to learn its digest, which is what a cache hit used to pay for.
+    """
+    digest = hashlib.sha256()
+    for key in sorted(state_dict):
+        tensor = state_dict[key]
+        digest.update(key.encode("utf-8"))
+        if not isinstance(tensor, torch.Tensor):
+            digest.update(repr(tensor).encode("utf-8"))
+            continue
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("utf-8"))
+        raw = tensor.detach().to("cpu").contiguous().flatten()
+        digest.update(raw.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _export_state_dict_artifact(state_dict: dict[str, Any], suffix: str) -> tuple[str, Path]:
+    """Materialise a state dict under a content-addressed name, reusing an existing export."""
     paths = get_runtime_paths()
+    digest = _state_dict_digest(state_dict)
+    artifact_path = stable_artifact_path(paths.artifacts, digest, suffix)
+    if artifact_path.exists():
+        return digest, artifact_path
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=paths.artifacts) as handle:
         temp_path = Path(handle.name)
-    comfy.utils.save_torch_file(state_dict, str(temp_path))
-    return hash_file(temp_path), temp_path
+    try:
+        comfy.utils.save_torch_file(state_dict, str(temp_path))
+        temp_path.replace(artifact_path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return digest, artifact_path
 
 
-def _resolve_clip_slot(name: str, value: Any, ephemeral_artifacts: list[Path]) -> ResolvedSlot:
+def _resolve_clip_slot(name: str, value: Any) -> ResolvedSlot:
     try:
         clip_paths = _recover_clip_paths(value)
         fingerprint = hash_text("|".join(clip_paths))
         return ResolvedSlot(name=name, replacement=clip_paths[0], fingerprint=fingerprint)
     except Exception:
         digest, exported_path = _export_state_dict_artifact(value.get_sd(), ".safetensors")
-        ephemeral_artifacts.append(exported_path)
         return ResolvedSlot(name=name, replacement=str(exported_path), fingerprint=digest)
 
 
-def _resolve_vae_slot(name: str, value: Any, ephemeral_artifacts: list[Path]) -> ResolvedSlot:
+def _resolve_vae_slot(name: str, value: Any) -> ResolvedSlot:
     digest, exported_path = _export_state_dict_artifact(value.get_sd(), ".safetensors")
-    ephemeral_artifacts.append(exported_path)
     return ResolvedSlot(name=name, replacement=str(exported_path), fingerprint=digest)
 
 
-def _resolve_slot(slot: SlotSpec, raw_value: Any, ephemeral_artifacts: list[Path]) -> ResolvedSlot:
+def _resolve_slot(slot: SlotSpec, raw_value: Any) -> ResolvedSlot:
     if slot.slot_type == "STRING":
         return _resolve_string_slot(slot.name, raw_value)
     if slot.slot_type == "MODEL":
         return _resolve_model_slot(slot.name, raw_value)
     if slot.slot_type == "CLIP":
-        return _resolve_clip_slot(slot.name, raw_value, ephemeral_artifacts)
+        return _resolve_clip_slot(slot.name, raw_value)
     if slot.slot_type == "VAE":
-        return _resolve_vae_slot(slot.name, raw_value, ephemeral_artifacts)
+        return _resolve_vae_slot(slot.name, raw_value)
     raise RuntimeError(f"Unsupported slot type: {slot.slot_type}")
-
-
-def _cleanup_ephemeral_artifacts(paths: list[Path]) -> None:
-    for path in paths:
-        path.unlink(missing_ok=True)
 
 
 def _tagger_model_location(model_dir: Path, repo_id: str) -> Path:
@@ -656,7 +702,7 @@ def _cache_key(
     train_options: TrainOptions,
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(NODE_VERSION.encode("utf-8"))
+    digest.update(CACHE_FORMAT_VERSION.encode("utf-8"))
     digest.update(checkpoint_path.encode("utf-8"))
     digest.update(profile.file_hash.encode("utf-8"))
     digest.update(image_hash.encode("utf-8"))
@@ -965,119 +1011,116 @@ class InstantReferenceLoRA(io.ComfyNode):
 
 
 def _train_reference_lora(model, clip, images, profile, tagging_options=None, train_options=None) -> TrainingResult:
-    ephemeral_artifacts: list[Path] = []
-    try:
-        profile_key = profile["profile"]
-        selected_profile = profile_map(_plugin_root())[profile_key]
-        resolved_tagging = _tagging_options_from_input(tagging_options)
-        resolved_train = _train_options_from_input(train_options)
-        target_steps = _effective_max_train_steps(selected_profile, resolved_train)
-        model_slot = _primary_profile_slot(selected_profile, "MODEL")
-        if model_slot is None:
-            raise RuntimeError(f"Profile '{selected_profile.name}' must define a MODEL slot such as '{{{{model:MODEL}}}}'.")
-        checkpoint_path = _recover_model_checkpoint_path(model)
-        temp_image_hash = hash_tensor_batch(images)
-        paths = get_runtime_paths()
-        temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
-        temp_run_log = temp_run_dir / "run.log"
-        dataset_dir, image_hash, captions_hash, captions = _prepare_dataset(
-            images,
-            log_path=temp_run_log,
-            options=resolved_tagging,
-            target_steps=target_steps,
-        )
-        dataset_tags = _collect_dataset_tags(captions)
+    profile_key = profile["profile"]
+    selected_profile = profile_map(_plugin_root())[profile_key]
+    resolved_tagging = _tagging_options_from_input(tagging_options)
+    resolved_train = _train_options_from_input(train_options)
+    target_steps = _effective_max_train_steps(selected_profile, resolved_train)
+    model_slot = _primary_profile_slot(selected_profile, "MODEL")
+    if model_slot is None:
+        raise RuntimeError(f"Profile '{selected_profile.name}' must define a MODEL slot such as '{{{{model:MODEL}}}}'.")
+    checkpoint_path = _recover_model_checkpoint_path(model)
+    temp_image_hash = hash_tensor_batch(images)
+    paths = get_runtime_paths()
+    temp_run_dir = ensure_dir(paths.cache / f"_inflight_{temp_image_hash}")
+    temp_run_log = temp_run_dir / "run.log"
+    dataset_dir, image_hash, captions_hash, captions = _prepare_dataset(
+        images,
+        log_path=temp_run_log,
+        options=resolved_tagging,
+        target_steps=target_steps,
+    )
+    dataset_tags = _collect_dataset_tags(captions)
 
-        resolved_slots: dict[str, ResolvedSlot] = {}
-        for slot in selected_profile.slots:
-            if slot.slot_type == "MODEL":
-                resolved_slots[slot.name] = _resolve_slot(slot, model, ephemeral_artifacts)
-                continue
-            if slot.slot_type == "CLIP":
-                resolved_slots[slot.name] = _resolve_slot(slot, clip, ephemeral_artifacts)
-                continue
-            if slot.name not in profile:
-                raise RuntimeError(f"Profile '{selected_profile.name}' requires input '{slot.name}'.")
-            resolved_slots[slot.name] = _resolve_slot(slot, profile[slot.name], ephemeral_artifacts)
+    resolved_slots: dict[str, ResolvedSlot] = {}
+    for slot in selected_profile.slots:
+        if slot.slot_type == "MODEL":
+            resolved_slots[slot.name] = _resolve_slot(slot, model)
+            continue
+        if slot.slot_type == "CLIP":
+            resolved_slots[slot.name] = _resolve_slot(slot, clip)
+            continue
+        if slot.name not in profile:
+            raise RuntimeError(f"Profile '{selected_profile.name}' requires input '{slot.name}'.")
+        resolved_slots[slot.name] = _resolve_slot(slot, profile[slot.name])
 
-        cache_key = _cache_key(
-            checkpoint_path=checkpoint_path,
-            profile=selected_profile,
-            image_hash=image_hash,
-            captions_hash=captions_hash,
-            slots=resolved_slots,
-            tagging_options=resolved_tagging,
-            train_options=resolved_train,
-        )
+    cache_key = _cache_key(
+        checkpoint_path=checkpoint_path,
+        profile=selected_profile,
+        image_hash=image_hash,
+        captions_hash=captions_hash,
+        slots=resolved_slots,
+        tagging_options=resolved_tagging,
+        train_options=resolved_train,
+    )
 
-        run_dir = ensure_dir(paths.cache / cache_key)
-        run_log = run_dir / "run.log"
-        if temp_run_log != run_log:
-            _merge_run_log(temp_run_log, run_log)
-        output_dir = ensure_dir(paths.outputs / cache_key)
-        output_name = f"instant_lora_{cache_key[:12]}"
-        manifest = run_dir / "manifest.json"
-        cached_lora = None if resolved_train.force_retrain else latest_safetensors(output_dir)
-        thumbnail_path = _first_dataset_image(dataset_dir)
-        manifest_payload = {
-            "cache_key": cache_key,
-            "checkpoint_path": checkpoint_path,
-            "profile": selected_profile.key,
-            "profile_file": str(selected_profile.file_path),
+    run_dir = ensure_dir(paths.cache / cache_key)
+    run_log = run_dir / "run.log"
+    if temp_run_log != run_log:
+        _merge_run_log(temp_run_log, run_log)
+    output_dir = ensure_dir(paths.outputs / cache_key)
+    output_name = f"instant_lora_{cache_key[:12]}"
+    manifest = run_dir / "manifest.json"
+    cached_lora = None if resolved_train.force_retrain else latest_safetensors(output_dir)
+    thumbnail_path = _first_dataset_image(dataset_dir)
+    manifest_payload = {
+        "cache_key": cache_key,
+        "node_version": NODE_VERSION,
+        "checkpoint_path": checkpoint_path,
+        "profile": selected_profile.key,
+        "profile_file": str(selected_profile.file_path),
+        "dataset_dir": str(dataset_dir),
+        "thumbnail_path": str(thumbnail_path) if thumbnail_path else "",
+        "captions": captions,
+        "tags": dataset_tags,
+        "tagging_options": resolved_tagging.__dict__,
+        "train_options": resolved_train.__dict__,
+        "resolved_slots": {name: slot.replacement for name, slot in resolved_slots.items()},
+    }
+
+    if cached_lora is None:
+        _report_status("preparing training runtime")
+        ensure_sd_scripts_environment(paths, log_path=run_log)
+        builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
+        config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
+        manifest_payload["config_path"] = str(config_path)
+        write_json(manifest, manifest_payload)
+        comfy.model_management.unload_all_models()
+        soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
+        if callable(soft_empty_cache):
+            soft_empty_cache()
+        cached_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
+    else:
+        _report_status("reusing cached LoRA")
+
+    if manifest.exists():
+        try:
+            existing_manifest = json.loads(manifest.read_text(encoding="utf-8"))
+            if isinstance(existing_manifest, dict):
+                manifest_payload.update(existing_manifest)
+        except (OSError, json.JSONDecodeError):
+            pass
+    created_at = manifest_payload.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        created_at = time.time()
+    manifest_payload.update(
+        {
             "dataset_dir": str(dataset_dir),
             "thumbnail_path": str(thumbnail_path) if thumbnail_path else "",
-            "captions": captions,
+            "lora_path": str(cached_lora),
+            "created_at": float(created_at),
+            "updated_at": time.time(),
             "tags": dataset_tags,
-            "tagging_options": resolved_tagging.__dict__,
-            "train_options": resolved_train.__dict__,
-            "resolved_slots": {name: slot.replacement for name, slot in resolved_slots.items()},
         }
-
-        if cached_lora is None:
-            _report_status("preparing training runtime")
-            ensure_sd_scripts_environment(paths, log_path=run_log)
-            builtins = _builtins_for_run(dataset_dir, output_dir, output_name)
-            config_path = _write_resolved_config(selected_profile, resolved_slots, builtins, run_dir, resolved_train)
-            manifest_payload["config_path"] = str(config_path)
-            write_json(manifest, manifest_payload)
-            comfy.model_management.unload_all_models()
-            soft_empty_cache = getattr(comfy.model_management, "soft_empty_cache", None)
-            if callable(soft_empty_cache):
-                soft_empty_cache()
-            cached_lora = _run_training(selected_profile, run_dir, output_dir, config_path, log_path=run_log)
-        else:
-            _report_status("reusing cached LoRA")
-
-        if manifest.exists():
-            try:
-                existing_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-                if isinstance(existing_manifest, dict):
-                    manifest_payload.update(existing_manifest)
-            except (OSError, json.JSONDecodeError):
-                pass
-        created_at = manifest_payload.get("created_at")
-        if not isinstance(created_at, (int, float)):
-            created_at = time.time()
-        manifest_payload.update(
-            {
-                "dataset_dir": str(dataset_dir),
-                "thumbnail_path": str(thumbnail_path) if thumbnail_path else "",
-                "lora_path": str(cached_lora),
-                "created_at": float(created_at),
-                "updated_at": time.time(),
-                "tags": dataset_tags,
-            }
-        )
-        metadata_path = _write_lora_metadata(cached_lora, selected_profile, thumbnail_path, manifest_payload)
-        manifest_payload["metadata_path"] = str(metadata_path)
-        preview_path = _preview_sidecar_path(cached_lora, thumbnail_path)
-        manifest_payload["preview_path"] = str(preview_path) if preview_path and preview_path.exists() else ""
-        write_json(manifest, manifest_payload)
-        write_json(_lora_manifest_path(cached_lora), manifest_payload)
-        _record_last_lora(cached_lora)
-        return TrainingResult(lora_path=cached_lora, tags=dataset_tags)
-    finally:
-        _cleanup_ephemeral_artifacts(ephemeral_artifacts)
+    )
+    metadata_path = _write_lora_metadata(cached_lora, selected_profile, thumbnail_path, manifest_payload)
+    manifest_payload["metadata_path"] = str(metadata_path)
+    preview_path = _preview_sidecar_path(cached_lora, thumbnail_path)
+    manifest_payload["preview_path"] = str(preview_path) if preview_path and preview_path.exists() else ""
+    write_json(manifest, manifest_payload)
+    write_json(_lora_manifest_path(cached_lora), manifest_payload)
+    _record_last_lora(cached_lora)
+    return TrainingResult(lora_path=cached_lora, tags=dataset_tags)
 
 
 def _execute_reference_train(model, clip, images, profile, tagging_options=None, train_options=None) -> io.NodeOutput:
